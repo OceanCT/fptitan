@@ -124,12 +124,8 @@ bool BasicBlobGCPicker::GCFinished(BlobStorage* blob_storage) {
 	  debugger.dprintln("blob_file[%d] state: %d", gc_score.file_number, blob_file->file_state());
 	  return false;
 	}
-    if (gc_score.score >= cf_options_.blob_file_discardable_ratio) { 
-	  debugger.dprintln("blob_file[%d] gc_score: %lf", gc_score.file_number, gc_score.score);
-	  return false;
-	}
   }	
-  return true;
+  return PickBlobGC(blob_storage) == nullptr;
 }
 
 

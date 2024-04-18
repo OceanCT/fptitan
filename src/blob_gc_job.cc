@@ -152,6 +152,7 @@ Status BlobGCJob::Run() {
 }
 
 Status BlobGCJob::DoRunGC() {
+	
 	if(blob_gc_->titan_cf_options().fpindex_enable) {
 		assert(fp_index_ != NULL);
 		return DoRunGCWithFP();
@@ -172,6 +173,7 @@ typedef struct AddBlobNode {
 
 Status BlobGCJob::DoRunGCWithFP() {
   Debugger debugger("|blob_gc_job.cc|DoRunGCWithTT:");
+  Debugger recordTrailDebugger("RecordTrail");
   Status s;
   std::unique_ptr<BlobFileMergeIterator> gc_iter;
   s = BuildIterator(&gc_iter);
@@ -212,21 +214,27 @@ Status BlobGCJob::DoRunGCWithFP() {
 	ctx->key = ikey.Encode().ToString();
 	ctx->original_blob_index = index;
 	ctx->new_blob_index.file_number = blob_file_handle->GetNumber();
-
 	BlobFileBuilder::OutContexts contexts;
 	blob_file_builder->Add(record, std::move(ctx), &contexts);
 	BatchWriteNewIndices(contexts, &s);	
-  	file_size += index.blob_handle.size;
   };
 
-  auto addRecordToTmp = [&](BlobRecord& record, BlobIndex& index) {
+  auto addRecordToTmp = [&](BlobRecord& record, BlobIndex& index, bool for_fp = false) {
 	  // debugger.dprintln("Add record to tmp, record key: %s", record.key.ToString().c_str());
 	  add_blob_nodes.resize(add_blob_nodes.size() + 1);
 	  add_blob_nodes[add_blob_nodes.size() - 1].index = index;
 	  add_blob_nodes[add_blob_nodes.size() - 1].key = record.key.ToString();
 	  add_blob_nodes[add_blob_nodes.size() - 1].value = record.value.ToString();
+  	  file_size += index.blob_handle.size;
+	  if(!for_fp) {
+		  recordTrailDebugger.dprintln("Record[key: %s][Type: NormalGC] going from Blob[%d] to Blob[%d]", 
+	   record.key.ToString().c_str(), index.file_number, blob_file_handle->GetNumber());
+	  } else {
+		  recordTrailDebugger.dprintln("Record[key: %s][Type: FPGC] going from Blob[%d] to Blob[%d]", 
+	   record.key.ToString().c_str(), index.file_number, blob_file_handle->GetNumber());
+	  }
   };
-
+	
   auto dumpToBlob = [&]() {
 	  sort(add_blob_nodes.begin(), add_blob_nodes.end(), [&](AddBlobNode a, AddBlobNode b) {
 		  return blob_gc_->titan_cf_options().comparator->Compare(Slice(a.key), Slice(b.key)) < 0;
@@ -238,7 +246,28 @@ Status BlobGCJob::DoRunGCWithFP() {
 	  }
 	  add_blob_nodes.clear();
   };
-
+  auto finishBlob = [&]() {
+	debugger.dprintln("finishing blob file");
+	assert(blob_file_builder);
+    assert(blob_file_handle);
+	assert(blob_file_builder->status().ok());
+    dumpToBlob();
+    blob_file_builders_.emplace_back(std::make_pair(
+            std::move(blob_file_handle), std::move(blob_file_builder)));
+    s = blob_file_manager_->NewFile(&blob_file_handle, Env::IOPriority::IO_LOW);
+    if (!s.ok()) { 
+		debugger.dprintln("errors occurred when finishing blob file, status: %d", s.code());
+		return; 
+	}
+    TITAN_LOG_INFO(db_options_.info_log,
+                    "Titan new GC output file %" PRIu64 ".",
+                    blob_file_handle->GetNumber());
+    blob_file_builder = std::unique_ptr<BlobFileBuilder>(
+    	new BlobFileBuilder(db_options_, blob_gc_->titan_cf_options(),
+                              blob_file_handle->GetFile()));
+    file_size = 0;
+  };
+  checkBlobNull();
   for (; gc_iter->Valid(); gc_iter->Next()) {
     if (IsShutingDown()) {
       s = Status::ShutdownInProgress();
@@ -286,19 +315,24 @@ Status BlobGCJob::DoRunGCWithFP() {
     }
 	
 	
-	checkBlobNull();
 	if(!s.ok()) break;
+
+	if(file_size > blob_gc_->titan_cf_options().blob_file_target_size) { 
+		debugger.dprintln("finish Blob[%d] because file_size is larger than target size", blob_file_handle->GetNumber());
+		finishBlob(); 
+	}
 
 	BlobRecord blob_record;
     blob_record.key = gc_iter->key();
     blob_record.value = gc_iter->value();
     metrics_.gc_bytes_written += blob_record.size();
 	
-	addRecordToTmp(blob_record, blob_index);
+	addRecordToTmp(blob_record, blob_index, false);
 	if(!s.ok()) break;
 	debugger.dprintln("try find similar records of value: %s", blob_record.value.ToString().c_str());
 	std::vector<std::pair<std::string, BlobIndex>> similar_records;
 	fp_index_->FindSimilarRecords(gc_iter->key().ToString(), blob_record.value.ToString(), similar_records);
+	
 	for(auto tmp: similar_records) {
 		std::string similar_record_key = tmp.first;
 		BlobIndex similar_record_index = tmp.second;
@@ -322,20 +356,12 @@ Status BlobGCJob::DoRunGCWithFP() {
 		}
 		debugger.dprintln("Similar Record Key: %s,(Key: %s, Value: %s", similar_record_key.c_str(), similar_record.key.ToString().c_str(), similar_record.value.ToString().c_str());
 		if(!s.ok()) break;
-		addRecordToTmp(similar_record, similar_record_index);
+		addRecordToTmp(similar_record, similar_record_index, true);
 		fp_index_->AddSuccessfulFP(1);
 	}
   }
-  dumpToBlob();
-  if (gc_iter->status().ok() && s.ok()) {
-    if (blob_file_builder && blob_file_handle) {
-      assert(blob_file_builder->status().ok());
-      blob_file_builders_.emplace_back(std::make_pair(
-          std::move(blob_file_handle), std::move(blob_file_builder)));
-    } else {
-      assert(!blob_file_builder);
-      assert(!blob_file_handle);
-    }
+  if(gc_iter->status().ok() && s.ok() && file_size > 0) {
+	finishBlob();
   } else if (!gc_iter->status().ok()) {
     return gc_iter->status();
   }
@@ -453,7 +479,7 @@ Status BlobGCJob::DoRunGCWithoutFP() {
     // count written bytes for new blob record,
     // blob index's size is counted in `RewriteValidKeyToLSM`
     metrics_.gc_bytes_written += blob_record.size();
-
+	
     // BlobRecordContext require key to be an internal key. We encode key to
     // internal key in spite we only need the user key.
     std::unique_ptr<BlobFileBuilder::BlobRecordContext> ctx(
